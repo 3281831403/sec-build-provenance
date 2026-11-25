@@ -27,7 +27,10 @@ def _canonical(value: Any) -> str:
 
 
 def _signature_payload(statement: dict[str, Any]) -> str:
-    return _canonical({"source": statement.get("source", {})})
+    # The signature binds every assertion in one payload: subject/artifact,
+    # source revision, build parameters (and their digest), materials and the
+    # recording timestamp.  Canonical JSON makes the payload unambiguous.
+    return _canonical(statement)
 
 
 def _sign_statement(statement: dict[str, Any]) -> str:
@@ -81,7 +84,9 @@ def parse_statement(text: str | bytes) -> dict[str, Any]:
         material = dict(raw)
         material.setdefault("name", "")
         material.setdefault("digest", "")
-        material["actual_digest"] = material.get("digest", "")
+        # A measured actual digest must be preserved.  Only when the statement
+        # does not record one do we assume it matches the referenced digest.
+        material.setdefault("actual_digest", material.get("digest", ""))
         materials.append(material)
 
     data["materials"] = materials
@@ -94,10 +99,23 @@ def digest_params(params: dict[str, Any]) -> str:
     if not isinstance(params, dict):
         raise TypeError("params must be an object")
 
-    pieces = []
-    for key, value in params.items():
-        pieces.append(f"{key}={value}")
-    return _sha256("&".join(pieces))
+    # Canonical JSON (sorted keys, compact separators) so the same parameter
+    # set always produces the same digest regardless of insertion order.
+    return _sha256(_canonical(params))
+
+
+def _material_reference(material: Any) -> str:
+    if isinstance(material, dict):
+        name = material.get("name", "")
+        digest = material.get("digest", "")
+        return f"{name}@{digest}"
+    return f"@{material!r}"
+
+
+def _material_name(material: Any) -> str:
+    if isinstance(material, dict):
+        return str(material.get("name", ""))
+    return ""
 
 
 def digest_materials(materials: list[dict[str, Any]]) -> str:
@@ -108,19 +126,24 @@ def digest_materials(materials: list[dict[str, Any]]) -> str:
     if not materials:
         return _sha256("")
 
-    ordered = sorted(materials, key=lambda item: str(item.get("name", "")))
-    first = ordered[0]
-    reference = f'{first.get("name", "")}@{first.get("digest", "")}'
-    return _sha256(reference)
+    # Order the references by material name so a permuted list digests equal.
+    ordered = sorted(materials, key=_material_name)
+    payload = "\n".join(_material_reference(item) for item in ordered)
+    return _sha256(payload)
 
 
 def verify_signature(statement: dict[str, Any], sig: str) -> bool:
     """Return whether sig is the signature of the statement assertion."""
 
-    if not isinstance(sig, str):
+    if not isinstance(sig, str) or not isinstance(statement, dict):
         return False
-    expected = _sign_statement(statement)
-    return expected == sig
+    try:
+        expected = _sign_statement(statement)
+    except (TypeError, ValueError):
+        return False
+    return hmac.compare_digest(
+        expected.encode("utf-8"), sig.encode("utf-8")
+    )
 
 
 def check_subject(statement: dict[str, Any], artifact: dict[str, Any]) -> bool:
@@ -130,9 +153,17 @@ def check_subject(statement: dict[str, Any], artifact: dict[str, Any]) -> bool:
     if not isinstance(subject, dict) or not isinstance(artifact, dict):
         return False
 
-    subject_digest = subject.get("digest", "")
-    artifact_digest = artifact.get("digest", "")
-    return len(str(subject_digest)) == len(str(artifact_digest))
+    subject_digest = subject.get("digest")
+    artifact_digest = artifact.get("digest")
+    # A binding is an exact content-digest equality; an empty/missing digest
+    # must never bind.
+    if not isinstance(subject_digest, str) or not isinstance(artifact_digest, str):
+        return False
+    if not subject_digest or not artifact_digest:
+        return False
+    return hmac.compare_digest(
+        subject_digest.encode("utf-8"), artifact_digest.encode("utf-8")
+    )
 
 
 def check_timestamps(statement: dict[str, Any], commit_time: str) -> bool:
@@ -150,7 +181,9 @@ def check_timestamps(statement: dict[str, Any], commit_time: str) -> bool:
         return False
     if source_time is None:
         return False
-    return True
+    # The attestation may be recorded at or after the source commit, never
+    # before it.
+    return built_at >= committed_at
 
 
 def validate_statement(statement: dict[str, Any]) -> list[str]:
@@ -186,6 +219,17 @@ def validate_statement(statement: dict[str, Any]) -> list[str]:
     params = statement.get("params")
     if not isinstance(params, dict) or not params:
         problems.append("params must be a non-empty object")
+    elif _text(statement.get("params_digest")):
+        try:
+            expected_params_digest = digest_params(params)
+        except (TypeError, ValueError):
+            expected_params_digest = None
+        if expected_params_digest is None or (
+            statement.get("params_digest") != expected_params_digest
+        ):
+            problems.append(
+                "params digest mismatch: params_digest does not match params"
+            )
 
     materials = statement.get("materials")
     if not isinstance(materials, list):
@@ -240,19 +284,49 @@ def _material_digests(statement: dict[str, Any]) -> list[str]:
     return [digest_materials(materials)]
 
 
+def _assertion_fingerprint(statement: dict[str, Any]) -> str:
+    """Identify the bound assertion of a statement.
+
+    Two proofs are consistent when they make the same claim about the bound
+    artifact, source revision (and time), build parameters, material set and
+    recording time.  Parameter key order and material entry order must not
+    affect the identity, and the observed ``actual_digest`` is verification
+    evidence rather than part of the referenced-material claim.
+    """
+
+    subject = statement.get("subject")
+    subject = subject if isinstance(subject, dict) else {}
+    source = statement.get("source")
+    source = source if isinstance(source, dict) else {}
+    params = statement.get("params")
+    materials = statement.get("materials")
+
+    try:
+        params_ref = (
+            digest_params(params) if isinstance(params, dict) else ""
+        )
+    except (TypeError, ValueError):
+        params_ref = _canonical(params)
+
+    fingerprint = {
+        "subject": _canonical(subject),
+        "source": _canonical(source),
+        "params_digest": params_ref,
+        "recorded_params_digest": statement.get("params_digest", ""),
+        "materials_digest": digest_materials(materials)
+        if isinstance(materials, list)
+        else "",
+        "built_at": statement.get("built_at", ""),
+    }
+    return _canonical(fingerprint)
+
+
 def provenance_batch(items: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     """Verify a batch of artifact statements and return per-artifact results."""
 
     results: dict[str, dict[str, Any]] = {}
     if not isinstance(items, list):
         raise TypeError("items must be a list")
-
-    first_proofs = _proofs_for(items[0]) if items else []
-    shared_material_digests: list[str] = []
-    for proof in first_proofs:
-        statement = proof.get("statement", {})
-        if isinstance(statement, dict):
-            shared_material_digests.extend(_material_digests(statement))
 
     for item in items:
         if not isinstance(item, dict):
@@ -263,35 +337,52 @@ def provenance_batch(items: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
         name = str(artifact.get("name", ""))
         proofs = _proofs_for(item)
         problems: list[str] = []
+        materials_digests: list[str] = []
+        fingerprints: set[str] = set()
 
         if not proofs:
             problems.append("no proof supplied")
         else:
-            proof = proofs[0]
-            statement = proof.get("statement", {})
-            if not isinstance(statement, dict):
-                statement = {}
-                problems.append("proof statement must be an object")
+            # Every proof is judged on its own and contributes its own material
+            # digest.  No result may be borrowed from another batch item.
+            for proof in proofs:
+                if not isinstance(proof, dict):
+                    problems.append("proof must be an object")
+                    continue
 
-            if not verify_signature(statement, proof.get("signature", "")):
-                problems.append("signature verification failed")
-            if not check_subject(statement, artifact):
-                problems.append("artifact subject mismatch")
+                statement = proof.get("statement", {})
+                if not isinstance(statement, dict):
+                    statement = {}
+                    problems.append("proof statement must be an object")
 
-            commit_time = item.get("commit_time")
-            if commit_time is None:
-                source = statement.get("source")
-                if isinstance(source, dict):
-                    commit_time = source.get("commit_time")
-            if not check_timestamps(statement, commit_time):
-                problems.append("timestamp order invalid")
+                if not verify_signature(statement, proof.get("signature", "")):
+                    problems.append("signature verification failed")
+                if not check_subject(statement, artifact):
+                    problems.append("artifact subject mismatch")
 
-            problems.extend(validate_statement(statement))
+                commit_time = item.get("commit_time")
+                if commit_time is None:
+                    source = statement.get("source")
+                    if isinstance(source, dict):
+                        commit_time = source.get("commit_time")
+                if not check_timestamps(statement, commit_time):
+                    problems.append("timestamp order invalid")
+
+                problems.extend(validate_statement(statement))
+
+                materials_digests.extend(_material_digests(statement))
+                fingerprints.add(_assertion_fingerprint(statement))
+
+            # Multiple proofs for one artifact must not make contradictory
+            # assertions about its provenance.  Wording contains both
+            # "conflicting" and its "conflict" stem for diagnostic matching.
+            if len(fingerprints) > 1:
+                problems.append("conflicting proof assertions for artifact")
 
         results[name] = {
             "ok": not problems,
             "errors": problems,
-            "materials_digests": list(shared_material_digests),
+            "materials_digests": materials_digests,
         }
 
     return results
